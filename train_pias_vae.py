@@ -4,6 +4,8 @@ from torch.utils.data import DataLoader, TensorDataset
 import os
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
+from vae_time_series import PIASVAE, vae_loss_function, INPUT_DIM, LATENT_DIM
+
 
 # --- Global Configuration Constants ---
 SEQUENCE_LENGTH = 30  # Look-back window size
