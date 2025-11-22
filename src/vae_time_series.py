@@ -1,4 +1,3 @@
-# src/vae_time_series.py
 import os
 import numpy as np
 import torch
@@ -7,17 +6,18 @@ from torch.utils.data import TensorDataset, DataLoader
 from typing import Tuple, Optional, List
 
 # -------------------------
-# Configuration (tweak as needed)
+# Configuration (tweak as needed) - IMPORTANT: Must match train_pias_vae.py
 # -------------------------
 SEQUENCE_LENGTH = 30
 NUM_FEATURES = 14
 LATENT_DIM = 20
 HIDDEN_DIM = 128
 NUM_LAYERS = 1
+# Ensure the device is consistent across modules
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # -------------------------
-# PIAS LSTM-VAE
+# PIAS LSTM-VAE Model Definition
 # -------------------------
 class PIASVAE(nn.Module):
     """
@@ -44,7 +44,6 @@ class PIASVAE(nn.Module):
         self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
 
         # Decoder: map latent z -> repeated inputs to LSTM -> produce sequence
-        # We'll feed the latent vector (or transformed) as input at every time step.
         self.latent_to_dec_input = nn.Linear(latent_dim, hidden_dim)
         self.decoder_lstm = nn.LSTM(input_size=hidden_dim,
                                     hidden_size=hidden_dim,
@@ -61,6 +60,7 @@ class PIASVAE(nn.Module):
         return mu, logvar
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        """Reparameterization trick to sample z from N(mu, exp(logvar))"""
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
@@ -89,7 +89,6 @@ def vae_loss_function(recon_x: torch.Tensor, x: torch.Tensor, mu: torch.Tensor, 
     """
     Computes MSE reconstruction + KL divergence.
     Returns (total_loss, recon_loss, kld_loss) -- each scalar tensors.
-    reduction: 'mean' (per batch average) or 'sum'
     """
     # Reconstruction loss (MSE)
     mse = nn.MSELoss(reduction=reduction)
@@ -115,9 +114,7 @@ def train_vae_from_dataloader(dataloader: DataLoader,
                               device: torch.device = DEVICE) -> Tuple[PIASVAE, dict]:
     """
     Train the PIASVAE on sequences provided by dataloader.
-    dataloader should yield batches of shape (batch, seq_len, num_features) as float tensors.
     kl_anneal: optional dict {'start':0.0, 'end':1.0, 'n_epochs':50} to linearly anneal KLD weight.
-    Returns trained model and history dict.
     """
     model = PIASVAE(seq_len=SEQUENCE_LENGTH, num_features=NUM_FEATURES, latent_dim=LATENT_DIM,
                     hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS).to(device)
@@ -125,30 +122,34 @@ def train_vae_from_dataloader(dataloader: DataLoader,
 
     history = {'total_loss': [], 'recon_loss': [], 'kld_loss': []}
 
-    # Prepare KL annealing schedule if provided
-    if kl_anneal is not None:
-        start, end, n_epochs = kl_anneal.get('start', 0.0), kl_anneal.get('end', 1.0), kl_anneal.get('n_epochs', 50)
-    else:
-        start, end, n_epochs = kld_weight, kld_weight, 1
-
+    # Setup KL annealing schedule if provided
+    annealing_active = kl_anneal is not None and kl_anneal.get('n_epochs', 0) > 0
+    if annealing_active:
+        start_w = kl_anneal.get('start', 0.0)
+        end_w = kl_anneal.get('end', kld_weight)
+        n_anneal_epochs = kl_anneal.get('n_epochs', epochs)
+    
     n_batches = len(dataloader)
     model.train()
     for epoch in range(1, epochs + 1):
         epoch_total = 0.0
         epoch_recon = 0.0
         epoch_kld = 0.0
+        
+        # Determine current KLD weight
+        if annealing_active:
+            # Linear schedule across defined epochs
+            alpha = float(min(epoch, n_anneal_epochs)) / float(max(1, n_anneal_epochs))
+            cur_kld_weight = start_w + alpha * (end_w - start_w)
+        else:
+            # Constant weight
+            cur_kld_weight = kld_weight
+
         for batch_idx, batch in enumerate(dataloader):
             x_batch = batch[0].to(device)  # expecting TensorDataset with single tensor
             optimizer.zero_grad()
 
             recon_x, mu, logvar = model(x_batch)
-            # compute current kld multiplier
-            if kl_anneal is not None:
-                # linear schedule across epochs
-                alpha = float(min(epoch, n_epochs)) / float(max(1, n_epochs))
-                cur_kld_weight = start + alpha * (end - start)
-            else:
-                cur_kld_weight = kld_weight
 
             total_loss, recon_loss, kld_loss = vae_loss_function(recon_x, x_batch, mu, logvar,
                                                                 kld_weight=cur_kld_weight, reduction="mean")
@@ -167,13 +168,14 @@ def train_vae_from_dataloader(dataloader: DataLoader,
         if epoch % 10 == 0 or epoch == 1:
             print(f"Epoch {epoch}/{epochs} | Total: {history['total_loss'][-1]:.6f} | Recon: {history['recon_loss'][-1]:.6f} | KLD: {history['kld_loss'][-1]:.6f} | kld_w: {cur_kld_weight:.4f}")
 
+    # Ensure model save directory exists
     os.makedirs(os.path.dirname(model_savepath) or '.', exist_ok=True)
     torch.save(model.state_dict(), model_savepath)
     print(f"Saved VAE weights to {model_savepath}")
     return model, history
 
 # -------------------------
-# Helpers: encode dataset -> latents, decode latents -> sequences
+# Helpers: PIAS Interpolation and Data Synthesis
 # -------------------------
 def encode_dataset_to_latents(model: PIASVAE, data_tensor: torch.Tensor, batch_size: int = 128,
                               device: torch.device = DEVICE) -> np.ndarray:
@@ -186,7 +188,7 @@ def encode_dataset_to_latents(model: PIASVAE, data_tensor: torch.Tensor, batch_s
     with torch.no_grad():
         for batch in loader:
             x = batch[0].to(device)
-            mu, logvar = model.encode(x)
+            mu, _ = model.encode(x)
             # Use mu as latent embedding (deterministic)
             latents.append(mu.cpu().numpy())
     latents = np.concatenate(latents, axis=0)
@@ -218,10 +220,6 @@ def interpolate_and_synthesize(model: PIASVAE,
     """
     For each anomaly latent vector, interpolate between the normal center and the anomaly latent,
     decode multiple intermediate latents and produce synthetic sequences.
-
-    normal_latents_center: (latent_dim,) center of normal latent space (e.g., mean of normals)
-    anomaly_latents: (M, latent_dim) real anomaly latents
-    Returns synthetic_sequences: (M * n_per_anomaly * len(alphas)?, seq_len, num_features)
     """
 
     if alphas is None:
@@ -229,22 +227,22 @@ def interpolate_and_synthesize(model: PIASVAE,
         alphas = np.linspace(0.1, 1.0, n_per_anomaly)
 
     synth_list = []
-    for a_idx, alpha in enumerate(alphas):
-        # create a batch of interpolations for all anomaly latents at this alpha:
-        # z_interp = (1-alpha) * z_normal_center + alpha * z_anomaly
+    
+    # Process interpolation in batches for memory efficiency if necessary, 
+    # but here we iterate over predefined alpha steps
+    for alpha in alphas:
+        # Create interpolated latent vectors: z_interp = (1-alpha) * z_normal_center + alpha * z_anomaly
+        # normal_latents_center is (latent_dim,)
         z_interp = (1.0 - alpha) * normal_latents_center[np.newaxis, :] + alpha * anomaly_latents
-        # decode them in batches
+        
+        # Decode the interpolated latents
         decoded = decode_latents_to_sequences(model, z_interp, device=device)
         synth_list.append(decoded)
 
-    # synth_list is list of arrays (len(alphas), (M, seq_len, num_features))
-    # reshape to (M * len(alphas), seq_len, num_features)
+    # Reshape to (M * len(alphas), seq_len, num_features)
     synth_all = np.concatenate(synth_list, axis=0)
     return synth_all
 
-# -------------------------
-# Convenience pipeline to produce synthetic anomalies and save them
-# -------------------------
 def synthesize_and_save(model: PIASVAE,
                         X_all: np.ndarray,
                         y_all: np.ndarray,
@@ -253,25 +251,24 @@ def synthesize_and_save(model: PIASVAE,
                         alphas: Optional[List[float]] = None,
                         device: torch.device = DEVICE) -> None:
     """
-    High-level helper:
-    - X_all: numpy array (N, seq_len, num_features)
-    - y_all: numpy array (N,) labels (0 - normal, 1 - anomaly)
-    Produces synthetic anomalies and saves:
-      X_train_combined.npy, y_train_combined.npy
+    High-level helper: Produces synthetic anomalies and saves them alongside original data.
     """
     os.makedirs(save_dir, exist_ok=True)
 
     X_tensor = torch.from_numpy(X_all).float()
-    # encode normals and anomalies
+    
+    # 1. Separate normal and anomaly data
     normal_mask = (y_all == 0)
     anomaly_mask = (y_all == 1)
 
     if normal_mask.sum() == 0 or anomaly_mask.sum() == 0:
-        raise ValueError("Need both normal and anomaly samples to synthesize.")
+        print("Warning: Skipping synthesis. Need both normal (0) and anomaly (1) samples.")
+        return
 
     normals = X_tensor[normal_mask].to(device)
     anomalies = X_tensor[anomaly_mask].to(device)
 
+    # 2. Encode to latent space
     print("Encoding normal data to latents...")
     normal_latents = encode_dataset_to_latents(model, normals, device=device)
     normal_center = np.mean(normal_latents, axis=0)  # (latent_dim,)
@@ -279,12 +276,15 @@ def synthesize_and_save(model: PIASVAE,
     print("Encoding real anomalies to latents...")
     anomaly_latents = encode_dataset_to_latents(model, anomalies, device=device)
 
+    # 3. Interpolate and Decode
     print("Interpolating and decoding synthetic anomalies...")
     synthetic_seqs = interpolate_and_synthesize(model, normal_center, anomaly_latents,
                                                 n_per_anomaly=n_per_anomaly, alphas=alphas, device=device)
+    
+    # 
 
-    # Flatten sequences for downstream classifier if desired (or keep 3D)
-    # Here we'll save flattened arrays for backward compatibility, but recommend keeping 3D.
+    # 4. Prepare combined dataset
+    # Flatten sequences for downstream classifier (e.g., SVM, simple NN)
     synth_flat = synthetic_seqs.reshape(synthetic_seqs.shape[0], -1)
     X_flat_all = X_all.reshape(X_all.shape[0], -1)
 
@@ -293,6 +293,7 @@ def synthesize_and_save(model: PIASVAE,
     y_synth = np.ones(synth_flat.shape[0], dtype=np.int64)
     y_combined = np.concatenate([y_all, y_synth], axis=0)
 
+    # 5. Save
     print(f"Saving combined dataset to {save_dir} (X: {X_combined.shape}, y: {y_combined.shape})")
     np.save(os.path.join(save_dir, 'X_train_combined.npy'), X_combined)
     np.save(os.path.join(save_dir, 'y_train_combined.npy'), y_combined)
@@ -300,7 +301,7 @@ def synthesize_and_save(model: PIASVAE,
     print("Synthetic data saved. You can now run your classifier training script.")
 
 # -------------------------
-# Example small utility: build dataloader from flattened files (compatibility)
+# Utility: Build dataloader from flattened files (for classifier)
 # -------------------------
 def dataloader_from_flat_files(X_flat_path: str, y_path: str, batch_size: int = 128, seq_len: int = SEQUENCE_LENGTH,
                                num_features: int = NUM_FEATURES) -> DataLoader:
@@ -310,8 +311,12 @@ def dataloader_from_flat_files(X_flat_path: str, y_path: str, batch_size: int = 
     X_flat = np.load(X_flat_path)
     y = np.load(y_path)
     N = X_flat.shape[0]
-    X_seq = X_flat.reshape(N, seq_len, num_features)
-    X_tensor = torch.from_numpy(X_seq).float()
+    # Note: If the classifier expects flattened data, this reshaping is only needed if
+    # the VAE functions were called directly on the raw data.
+    # Since synthesize_and_save already saves *flattened* data, we assume the classifier
+    # will expect flattened data, so we remove the unnecessary reshape here for the classifier dataloader.
+    
+    X_tensor = torch.from_numpy(X_flat).float()
     y_tensor = torch.from_numpy(y).long()
     ds = TensorDataset(X_tensor, y_tensor)
     return DataLoader(ds, batch_size=batch_size, shuffle=True)
